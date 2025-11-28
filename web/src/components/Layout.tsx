@@ -18,7 +18,7 @@ export default function Layout({ children }: LayoutProps) {
   return (
     <div className="flex min-h-screen bg-gray-50 dark:bg-gray-900">
       {/* 侧边栏 */}
-      <aside className="w-64 bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
+      <aside className="w-64 bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 fixed h-full overflow-y-auto">
         <div className="p-6">
           <h1 className="text-xl font-bold text-gray-800 dark:text-white flex items-center gap-2">
             <Activity className="w-6 h-6 text-primary" />
@@ -49,7 +49,7 @@ export default function Layout({ children }: LayoutProps) {
         </nav>
 
         {/* 底部链接 */}
-        <div className="absolute bottom-4 left-4 right-4">
+        <div className="sticky bottom-4 left-4 right-4 mt-auto pt-4">
           <a
             href="/ui/"
             target="_blank"
@@ -62,7 +62,7 @@ export default function Layout({ children }: LayoutProps) {
       </aside>
 
       {/* 主内容区 */}
-      <main className="flex-1 p-8 overflow-auto">
+      <main className="flex-1 p-8 overflow-auto ml-64">
         {children}
       </main>
     </div>
