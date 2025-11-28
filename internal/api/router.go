@@ -1,0 +1,735 @@
+package api
+
+import (
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/xiaobei/singbox-manager/internal/builder"
+	"github.com/xiaobei/singbox-manager/internal/daemon"
+	"github.com/xiaobei/singbox-manager/internal/parser"
+	"github.com/xiaobei/singbox-manager/internal/service"
+	"github.com/xiaobei/singbox-manager/internal/storage"
+)
+
+// Server API 服务器
+type Server struct {
+	store          *storage.JSONStore
+	subService     *service.SubscriptionService
+	processManager *daemon.ProcessManager
+	launchdManager *daemon.LaunchdManager
+	scheduler      *service.Scheduler
+	router         *gin.Engine
+}
+
+// NewServer 创建 API 服务器
+func NewServer(store *storage.JSONStore, processManager *daemon.ProcessManager, launchdManager *daemon.LaunchdManager) *Server {
+	gin.SetMode(gin.ReleaseMode)
+
+	subService := service.NewSubscriptionService(store)
+
+	s := &Server{
+		store:          store,
+		subService:     subService,
+		processManager: processManager,
+		launchdManager: launchdManager,
+		scheduler:      service.NewScheduler(store, subService),
+		router:         gin.Default(),
+	}
+
+	// 设置调度器的更新回调
+	s.scheduler.SetUpdateCallback(s.autoApplyConfig)
+
+	s.setupRoutes()
+	return s
+}
+
+// StartScheduler 启动定时任务调度器
+func (s *Server) StartScheduler() {
+	s.scheduler.Start()
+}
+
+// StopScheduler 停止定时任务调度器
+func (s *Server) StopScheduler() {
+	s.scheduler.Stop()
+}
+
+// setupRoutes 设置路由
+func (s *Server) setupRoutes() {
+	// CORS 配置
+	s.router.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"*"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}))
+
+	// API 路由组
+	api := s.router.Group("/api")
+	{
+		// 订阅管理
+		api.GET("/subscriptions", s.getSubscriptions)
+		api.POST("/subscriptions", s.addSubscription)
+		api.PUT("/subscriptions/:id", s.updateSubscription)
+		api.DELETE("/subscriptions/:id", s.deleteSubscription)
+		api.POST("/subscriptions/:id/refresh", s.refreshSubscription)
+		api.POST("/subscriptions/refresh-all", s.refreshAllSubscriptions)
+
+		// 过滤器管理
+		api.GET("/filters", s.getFilters)
+		api.POST("/filters", s.addFilter)
+		api.PUT("/filters/:id", s.updateFilter)
+		api.DELETE("/filters/:id", s.deleteFilter)
+
+		// 规则管理
+		api.GET("/rules", s.getRules)
+		api.POST("/rules", s.addRule)
+		api.PUT("/rules/:id", s.updateRule)
+		api.DELETE("/rules/:id", s.deleteRule)
+
+		// 规则组管理
+		api.GET("/rule-groups", s.getRuleGroups)
+		api.PUT("/rule-groups/:id", s.updateRuleGroup)
+
+		// 设置
+		api.GET("/settings", s.getSettings)
+		api.PUT("/settings", s.updateSettings)
+
+		// 配置生成
+		api.POST("/config/generate", s.generateConfig)
+		api.POST("/config/apply", s.applyConfig)
+		api.GET("/config/preview", s.previewConfig)
+
+		// 服务管理
+		api.GET("/service/status", s.getServiceStatus)
+		api.POST("/service/start", s.startService)
+		api.POST("/service/stop", s.stopService)
+		api.POST("/service/restart", s.restartService)
+		api.POST("/service/reload", s.reloadService)
+
+		// launchd 管理
+		api.GET("/launchd/status", s.getLaunchdStatus)
+		api.POST("/launchd/install", s.installLaunchd)
+		api.POST("/launchd/uninstall", s.uninstallLaunchd)
+
+		// 系统监控
+		api.GET("/monitor/system", s.getSystemInfo)
+		api.GET("/monitor/logs", s.getLogs)
+
+		// 节点
+		api.GET("/nodes", s.getAllNodes)
+		api.GET("/nodes/countries", s.getCountryGroups)
+		api.GET("/nodes/country/:code", s.getNodesByCountry)
+		api.POST("/nodes/parse", s.parseNodeURL)
+
+		// 手动节点
+		api.GET("/manual-nodes", s.getManualNodes)
+		api.POST("/manual-nodes", s.addManualNode)
+		api.PUT("/manual-nodes/:id", s.updateManualNode)
+		api.DELETE("/manual-nodes/:id", s.deleteManualNode)
+	}
+
+	// 静态文件服务（前端）
+	s.router.Static("/assets", "./web/dist/assets")
+	s.router.StaticFile("/", "./web/dist/index.html")
+	s.router.NoRoute(func(c *gin.Context) {
+		c.File("./web/dist/index.html")
+	})
+}
+
+// Run 运行服务器
+func (s *Server) Run(addr string) error {
+	return s.router.Run(addr)
+}
+
+// ==================== 订阅 API ====================
+
+func (s *Server) getSubscriptions(c *gin.Context) {
+	subs := s.subService.GetAll()
+	c.JSON(http.StatusOK, gin.H{"data": subs})
+}
+
+func (s *Server) addSubscription(c *gin.Context) {
+	var req struct {
+		Name string `json:"name" binding:"required"`
+		URL  string `json:"url" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	sub, err := s.subService.Add(req.Name, req.URL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": sub})
+}
+
+func (s *Server) updateSubscription(c *gin.Context) {
+	id := c.Param("id")
+
+	var sub storage.Subscription
+	if err := c.ShouldBindJSON(&sub); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	sub.ID = id
+	if err := s.subService.Update(sub); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+}
+
+func (s *Server) deleteSubscription(c *gin.Context) {
+	id := c.Param("id")
+
+	if err := s.subService.Delete(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+func (s *Server) refreshSubscription(c *gin.Context) {
+	id := c.Param("id")
+
+	if err := s.subService.Refresh(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "刷新成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "刷新成功"})
+}
+
+func (s *Server) refreshAllSubscriptions(c *gin.Context) {
+	if err := s.subService.RefreshAll(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "刷新成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "刷新成功"})
+}
+
+// ==================== 过滤器 API ====================
+
+func (s *Server) getFilters(c *gin.Context) {
+	filters := s.store.GetFilters()
+	c.JSON(http.StatusOK, gin.H{"data": filters})
+}
+
+func (s *Server) addFilter(c *gin.Context) {
+	var filter storage.Filter
+	if err := c.ShouldBindJSON(&filter); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := s.store.AddFilter(filter); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": filter})
+}
+
+func (s *Server) updateFilter(c *gin.Context) {
+	id := c.Param("id")
+
+	var filter storage.Filter
+	if err := c.ShouldBindJSON(&filter); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	filter.ID = id
+	if err := s.store.UpdateFilter(filter); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+}
+
+func (s *Server) deleteFilter(c *gin.Context) {
+	id := c.Param("id")
+
+	if err := s.store.DeleteFilter(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+// ==================== 规则 API ====================
+
+func (s *Server) getRules(c *gin.Context) {
+	rules := s.store.GetRules()
+	c.JSON(http.StatusOK, gin.H{"data": rules})
+}
+
+func (s *Server) addRule(c *gin.Context) {
+	var rule storage.Rule
+	if err := c.ShouldBindJSON(&rule); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 生成 ID
+	rule.ID = uuid.New().String()
+
+	if err := s.store.AddRule(rule); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"data": rule, "warning": "添加成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": rule})
+}
+
+func (s *Server) updateRule(c *gin.Context) {
+	id := c.Param("id")
+
+	var rule storage.Rule
+	if err := c.ShouldBindJSON(&rule); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	rule.ID = id
+	if err := s.store.UpdateRule(rule); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "更新成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+}
+
+func (s *Server) deleteRule(c *gin.Context) {
+	id := c.Param("id")
+
+	if err := s.store.DeleteRule(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "删除成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
+
+// ==================== 规则组 API ====================
+
+func (s *Server) getRuleGroups(c *gin.Context) {
+	ruleGroups := s.store.GetRuleGroups()
+	c.JSON(http.StatusOK, gin.H{"data": ruleGroups})
+}
+
+func (s *Server) updateRuleGroup(c *gin.Context) {
+	id := c.Param("id")
+
+	var ruleGroup storage.RuleGroup
+	if err := c.ShouldBindJSON(&ruleGroup); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ruleGroup.ID = id
+	if err := s.store.UpdateRuleGroup(ruleGroup); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "更新成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+}
+
+// ==================== 设置 API ====================
+
+func (s *Server) getSettings(c *gin.Context) {
+	settings := s.store.GetSettings()
+	c.JSON(http.StatusOK, gin.H{"data": settings})
+}
+
+func (s *Server) updateSettings(c *gin.Context) {
+	var settings storage.Settings
+	if err := c.ShouldBindJSON(&settings); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := s.store.UpdateSettings(&settings); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 更新进程管理器的路径
+	s.processManager.SetPaths(settings.SingBoxPath, settings.ConfigPath)
+
+	// 重启调度器（可能更新了定时间隔）
+	s.scheduler.Restart()
+
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+}
+
+// ==================== 配置 API ====================
+
+func (s *Server) generateConfig(c *gin.Context) {
+	configJSON, err := s.buildConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": configJSON})
+}
+
+func (s *Server) previewConfig(c *gin.Context) {
+	configJSON, err := s.buildConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.String(http.StatusOK, configJSON)
+}
+
+func (s *Server) applyConfig(c *gin.Context) {
+	configJSON, err := s.buildConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 保存配置文件
+	settings := s.store.GetSettings()
+	if err := s.saveConfigFile(settings.ConfigPath, configJSON); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 检查配置
+	if err := s.processManager.Check(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 重启服务
+	if s.processManager.IsRunning() {
+		if err := s.processManager.Restart(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "配置已应用"})
+}
+
+func (s *Server) buildConfig() (string, error) {
+	settings := s.store.GetSettings()
+	nodes := s.store.GetAllNodes()
+	filters := s.store.GetFilters()
+	rules := s.store.GetRules()
+	ruleGroups := s.store.GetRuleGroups()
+
+	b := builder.NewConfigBuilder(settings, nodes, filters, rules, ruleGroups)
+	return b.BuildJSON()
+}
+
+func (s *Server) saveConfigFile(path, content string) error {
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+// autoApplyConfig 自动应用配置（如果 sing-box 正在运行）
+func (s *Server) autoApplyConfig() error {
+	settings := s.store.GetSettings()
+	if !settings.AutoApply {
+		return nil
+	}
+
+	// 生成配置
+	configJSON, err := s.buildConfig()
+	if err != nil {
+		return err
+	}
+
+	// 保存配置文件
+	if err := s.saveConfigFile(settings.ConfigPath, configJSON); err != nil {
+		return err
+	}
+
+	// 如果 sing-box 正在运行，则重启
+	if s.processManager.IsRunning() {
+		return s.processManager.Restart()
+	}
+
+	return nil
+}
+
+// ==================== 服务 API ====================
+
+func (s *Server) getServiceStatus(c *gin.Context) {
+	running := s.processManager.IsRunning()
+	pid := s.processManager.GetPID()
+
+	version := ""
+	if v, err := s.processManager.Version(); err == nil {
+		version = v
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": gin.H{
+			"running": running,
+			"pid":     pid,
+			"version": version,
+		},
+	})
+}
+
+func (s *Server) startService(c *gin.Context) {
+	if err := s.processManager.Start(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "服务已启动"})
+}
+
+func (s *Server) stopService(c *gin.Context) {
+	if err := s.processManager.Stop(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "服务已停止"})
+}
+
+func (s *Server) restartService(c *gin.Context) {
+	if err := s.processManager.Restart(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "服务已重启"})
+}
+
+func (s *Server) reloadService(c *gin.Context) {
+	if err := s.processManager.Reload(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "配置已重载"})
+}
+
+// ==================== launchd API ====================
+
+func (s *Server) getLaunchdStatus(c *gin.Context) {
+	installed := s.launchdManager.IsInstalled()
+	running := s.launchdManager.IsRunning()
+
+	c.JSON(http.StatusOK, gin.H{
+		"data": gin.H{
+			"installed": installed,
+			"running":   running,
+			"plistPath": s.launchdManager.GetPlistPath(),
+		},
+	})
+}
+
+func (s *Server) installLaunchd(c *gin.Context) {
+	settings := s.store.GetSettings()
+
+	config := daemon.LaunchdConfig{
+		SingBoxPath: settings.SingBoxPath,
+		ConfigPath:  settings.ConfigPath,
+		LogPath:     s.store.GetDataDir(),
+		WorkingDir:  s.store.GetDataDir(),
+		RunAtLoad:   true,
+		KeepAlive:   true,
+	}
+
+	if err := s.launchdManager.Install(config); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "服务已安装"})
+}
+
+func (s *Server) uninstallLaunchd(c *gin.Context) {
+	if err := s.launchdManager.Uninstall(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "服务已卸载"})
+}
+
+// ==================== 监控 API ====================
+
+func (s *Server) getSystemInfo(c *gin.Context) {
+	// TODO: 实现系统信息获取
+	c.JSON(http.StatusOK, gin.H{
+		"data": gin.H{
+			"hostname": "",
+			"platform": "darwin",
+			"cpu":      0,
+			"memory":   0,
+		},
+	})
+}
+
+func (s *Server) getLogs(c *gin.Context) {
+	logs := s.processManager.GetLogs()
+	c.JSON(http.StatusOK, gin.H{"data": logs})
+}
+
+// ==================== 节点 API ====================
+
+func (s *Server) getAllNodes(c *gin.Context) {
+	nodes := s.store.GetAllNodes()
+	c.JSON(http.StatusOK, gin.H{"data": nodes})
+}
+
+func (s *Server) getCountryGroups(c *gin.Context) {
+	groups := s.store.GetCountryGroups()
+	c.JSON(http.StatusOK, gin.H{"data": groups})
+}
+
+func (s *Server) getNodesByCountry(c *gin.Context) {
+	code := c.Param("code")
+	nodes := s.store.GetNodesByCountry(code)
+	c.JSON(http.StatusOK, gin.H{"data": nodes})
+}
+
+func (s *Server) parseNodeURL(c *gin.Context) {
+	var req struct {
+		URL string `json:"url" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	node, err := parser.ParseURL(req.URL)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "解析失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": node})
+}
+
+// ==================== 手动节点 API ====================
+
+func (s *Server) getManualNodes(c *gin.Context) {
+	nodes := s.store.GetManualNodes()
+	c.JSON(http.StatusOK, gin.H{"data": nodes})
+}
+
+func (s *Server) addManualNode(c *gin.Context) {
+	var node storage.ManualNode
+	if err := c.ShouldBindJSON(&node); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 生成 ID
+	node.ID = uuid.New().String()
+
+	if err := s.store.AddManualNode(node); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"data": node, "warning": "添加成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"data": node})
+}
+
+func (s *Server) updateManualNode(c *gin.Context) {
+	id := c.Param("id")
+
+	var node storage.ManualNode
+	if err := c.ShouldBindJSON(&node); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	node.ID = id
+	if err := s.store.UpdateManualNode(node); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "更新成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "更新成功"})
+}
+
+func (s *Server) deleteManualNode(c *gin.Context) {
+	id := c.Param("id")
+
+	if err := s.store.DeleteManualNode(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 自动应用配置
+	if err := s.autoApplyConfig(); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "删除成功，但自动应用配置失败: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+}
