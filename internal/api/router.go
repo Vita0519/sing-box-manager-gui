@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"os/user"
 	"strconv"
 	"time"
 
@@ -605,6 +606,18 @@ func (s *Server) reloadService(c *gin.Context) {
 // ==================== launchd API ====================
 
 func (s *Server) getLaunchdStatus(c *gin.Context) {
+	if s.launchdManager == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"data": gin.H{
+				"installed": false,
+				"running":   false,
+				"plistPath": "",
+				"supported": false,
+			},
+		})
+		return
+	}
+
 	installed := s.launchdManager.IsInstalled()
 	running := s.launchdManager.IsRunning()
 
@@ -613,11 +626,29 @@ func (s *Server) getLaunchdStatus(c *gin.Context) {
 			"installed": installed,
 			"running":   running,
 			"plistPath": s.launchdManager.GetPlistPath(),
+			"supported": true,
 		},
 	})
 }
 
 func (s *Server) installLaunchd(c *gin.Context) {
+	if s.launchdManager == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "当前系统不支持 launchd 服务"})
+		return
+	}
+
+	// 获取用户主目录（支持多种方式）
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		// 备用方案：使用 os/user 包
+		if u, err := user.Current(); err == nil && u.HomeDir != "" {
+			homeDir = u.HomeDir
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "获取用户目录失败"})
+			return
+		}
+	}
+
 	// 确保日志目录存在
 	logsDir := s.store.GetDataDir() + "/logs"
 
@@ -627,6 +658,7 @@ func (s *Server) installLaunchd(c *gin.Context) {
 		Port:       strconv.Itoa(s.port),
 		LogPath:    logsDir,
 		WorkingDir: s.store.GetDataDir(),
+		HomeDir:    homeDir,
 		RunAtLoad:  true,
 		KeepAlive:  true,
 	}
@@ -652,6 +684,11 @@ func (s *Server) installLaunchd(c *gin.Context) {
 }
 
 func (s *Server) uninstallLaunchd(c *gin.Context) {
+	if s.launchdManager == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "当前系统不支持 launchd 服务"})
+		return
+	}
+
 	if err := s.launchdManager.Uninstall(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -660,6 +697,11 @@ func (s *Server) uninstallLaunchd(c *gin.Context) {
 }
 
 func (s *Server) restartLaunchd(c *gin.Context) {
+	if s.launchdManager == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "当前系统不支持 launchd 服务"})
+		return
+	}
+
 	if err := s.launchdManager.Restart(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

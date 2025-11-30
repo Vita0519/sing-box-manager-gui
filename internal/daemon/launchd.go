@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"text/template"
 )
 
@@ -23,6 +25,11 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
         <string>-port</string>
         <string>{{.Port}}</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{.HomeDir}}</string>
+    </dict>
     <key>RunAtLoad</key>
     <{{if .RunAtLoad}}true{{else}}false{{end}}/>
     <key>KeepAlive</key>
@@ -44,6 +51,7 @@ type LaunchdConfig struct {
 	Port       string // Web 端口
 	LogPath    string
 	WorkingDir string
+	HomeDir    string // 用户主目录，用于设置 HOME 环境变量
 	RunAtLoad  bool
 	KeepAlive  bool
 }
@@ -56,7 +64,12 @@ type LaunchdManager struct {
 
 // NewLaunchdManager 创建 launchd 管理器
 func NewLaunchdManager() (*LaunchdManager, error) {
-	homeDir, err := os.UserHomeDir()
+	// 只在 macOS 上支持 launchd
+	if runtime.GOOS != "darwin" {
+		return nil, fmt.Errorf("launchd 仅在 macOS 上支持")
+	}
+
+	homeDir, err := getUserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("获取用户目录失败: %w", err)
 	}
@@ -68,6 +81,21 @@ func NewLaunchdManager() (*LaunchdManager, error) {
 		label:     label,
 		plistPath: plistPath,
 	}, nil
+}
+
+// getUserHomeDir 获取用户主目录，支持多种方式
+func getUserHomeDir() (string, error) {
+	// 首先尝试使用 os.UserHomeDir()
+	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
+		return homeDir, nil
+	}
+
+	// 备用方案：使用 os/user 包（不依赖 $HOME 环境变量）
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return u.HomeDir, nil
+	}
+
+	return "", fmt.Errorf("无法获取用户主目录")
 }
 
 // Install 安装 launchd 服务
